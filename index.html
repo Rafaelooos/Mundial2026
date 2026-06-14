@@ -568,6 +568,7 @@
       <button class="btn btn-outline btn-sm" onclick="filterMatches('group')" id="f-group">Faza grupowa</button>
       <button class="btn btn-outline btn-sm" onclick="filterMatches('knockout')" id="f-knockout">Faza pucharowa</button>
       <button class="btn btn-outline btn-sm admin-only" onclick="generateGroupFixtures()" id="f-gen" style="margin-left:auto;border-color:var(--green-light);color:var(--green-light)">⚡ Wygeneruj terminarz grupowy</button>
+      <button class="btn btn-outline btn-sm admin-only" onclick="loadRealResults()" id="f-real" style="border-color:var(--gold);color:var(--gold)">🏆 Załaduj wyniki Mundialu</button>
     </div>
 
     <div class="panel">
@@ -854,16 +855,22 @@ function loadLocalState() {
   };
 }
 
-// Zapis: najpierw lokalnie (natychmiast), potem do chmury
+// Zapis: ZAWSZE lokalnie (natychmiast i niezawodnie), potem próba chmury
 function saveState() {
-  localStorage.setItem('mundial2026', JSON.stringify(state));
+  state._ts = Date.now(); // znacznik czasu ostatniej zmiany
+  try {
+    localStorage.setItem('mundial2026', JSON.stringify(state));
+  } catch (e) {
+    console.error('Local save error:', e);
+    alert('Nie udało się zapisać lokalnie. Sprawdź, czy przeglądarka nie blokuje pamięci (tryb prywatny?).');
+    return;
+  }
   pushToCloud();
 }
 
 let pushTimer = null;
 function pushToCloud() {
-  if (!sb) return;
-  // debounce — nie wysyłaj przy każdym znaku, poczekaj chwilę
+  if (!sb) { setSyncStatus('local'); return; }
   clearTimeout(pushTimer);
   pushTimer = setTimeout(async () => {
     setSyncStatus('saving');
@@ -879,27 +886,35 @@ function pushToCloud() {
   }, 600);
 }
 
-// Pobranie stanu z chmury przy starcie
+// Pobranie stanu z chmury przy starcie — bez utraty danych lokalnych
 async function loadFromCloud() {
   if (!sb) { setSyncStatus('local'); return; }
   setSyncStatus('loading');
   try {
     const { data, error } = await sb.from('tournament').select('data').eq('id', ROW_ID).maybeSingle();
     if (error) throw error;
-    if (data && data.data) {
-      state = data.data;
+
+    const cloud = data && data.data ? data.data : null;
+    const localTs = state._ts || 0;
+    const cloudTs = cloud && cloud._ts ? cloud._ts : 0;
+
+    // Użyj danych z chmury TYLKO jeśli są nowsze niż lokalne.
+    // Dzięki temu odświeżenie strony nigdy nie kasuje świeżo wpisanych meczów.
+    if (cloud && cloudTs >= localTs) {
+      state = cloud;
       localStorage.setItem('mundial2026', JSON.stringify(state));
       render();
       populateTeamSelects();
       applyAuthUI();
     } else {
-      // pusty rekord w chmurze → wgraj obecny stan lokalny
+      // lokalne dane są nowsze (lub w chmurze pusto) → wgraj je do chmury
       await sb.from('tournament').upsert({ id: ROW_ID, data: state, updated_at: new Date().toISOString() });
     }
     cloudReady = true;
     setSyncStatus('saved');
   } catch (e) {
     console.error('Cloud load error:', e);
+    // KLUCZOWE: błąd chmury NIE kasuje danych — pracujemy dalej lokalnie
     setSyncStatus('error');
   }
 }
@@ -1506,6 +1521,44 @@ function generateGroupFixtures() {
   saveState();
   render();
   alert(added ? `Dodano ${added} meczów grupowych. Kliknij w mecz, aby wpisać wynik.` : 'Wszystkie mecze grupowe już istnieją.');
+}
+
+// Prawdziwe wyniki Mundialu 2026 (źródło: FIFA, stan na 14.06.2026)
+function loadRealResults() {
+  if (!confirm('Załadować rozegrane mecze Mundialu z prawdziwymi wynikami? Istniejące mecze tych spotkań zostaną zaktualizowane.')) return;
+  // [grupa, gospodarz, gość, wynikH, wynikA, data]
+  const real = [
+    ['A','🇲🇽 Meksyk','🇿🇦 RPA','2','0','2026-06-11'],
+    ['A','🇰🇷 Korea Płd.','🇨🇿 Czechy','2','1','2026-06-12'],
+    ['B','🇨🇦 Kanada','🇧🇦 Bośnia i Herc.','1','1','2026-06-12'],
+    ['D','🇺🇸 USA','🇵🇾 Paragwaj','4','1','2026-06-13'],
+    ['B','🇶🇦 Katar','🇨🇭 Szwajcaria','1','1','2026-06-13'],
+    ['C','🇧🇷 Brazylia','🇲🇦 Maroko','1','1','2026-06-13'],
+    ['C','🇭🇹 Haiti','🏴󠁧󠁢󠁳󠁣󠁴󠁿 Szkocja','0','1','2026-06-14'],
+  ];
+  let added = 0, updated = 0;
+  real.forEach(([g, home, away, sh, sa, date]) => {
+    // znajdź istniejący mecz tej pary (w dowolnej kolejności)
+    let m = state.matches.find(x => x.phase==='group' &&
+      ([x.home,x.away].sort().join('|') === [home,away].sort().join('|')));
+    if (m) {
+      // ustaw wynik z właściwą kolejnością gospodarz/gość
+      if (m.home === home) { m.scoreHome = sh; m.scoreAway = sa; }
+      else { m.scoreHome = sa; m.scoreAway = sh; }
+      m.date = date; m.group = g;
+      updated++;
+    } else {
+      state.matches.push({
+        id: Date.now().toString() + Math.random().toString(36).slice(2,7),
+        phase:'group', group:g, date, venue:'',
+        home, away, scoreHome: sh, scoreAway: sa, note:''
+      });
+      added++;
+    }
+  });
+  saveState();
+  render();
+  alert(`Gotowe! Dodano ${added}, zaktualizowano ${updated} meczów. Tabele przeliczyły się automatycznie.`);
 }
 
 function updatePhaseUI() {
